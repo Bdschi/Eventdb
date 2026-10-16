@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlencode, quote
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -63,6 +63,104 @@ def wikipedia_url(title):
         "https://en.wikipedia.org/wiki/"
         + quote(title.replace(" ", "_"), safe=":/()'")
     )
+
+
+# Namespaces that are not encyclopedia articles.
+NON_ARTICLE_NAMESPACES = {
+    "book",
+    "category",
+    "draft",
+    "file",
+    "help",
+    "media",
+    "mediawiki",
+    "module",
+    "portal",
+    "special",
+    "talk",
+    "template",
+    "timedtext",
+    "topic",
+    "user",
+    "wikipedia",
+}
+
+
+def article_url_from_title(raw_title, host="en.wikipedia.org"):
+    title = unquote(raw_title).replace("_", " ").strip()
+
+    if not title:
+        return None
+
+    if ":" in title:
+        namespace = title.split(":", 1)[0].casefold()
+
+        if namespace in NON_ARTICLE_NAMESPACES:
+            return None
+
+    if host in ("en.wikipedia.org", "wikipedia.org"):
+        return wikipedia_url(title)
+
+    return (
+        f"https://{host}/wiki/"
+        + quote(title.replace(" ", "_"), safe=":/()'")
+    )
+
+
+def wikipedia_article_url(href):
+    """
+    Turn a link from parsed Wikipedia HTML into an article URL.
+
+    Event names normally link to /wiki/Article_Title. Red links point at
+    the same article title even when the page does not exist yet.
+    """
+
+    if not href:
+        return None
+
+    href = href.strip()
+
+    if not href or href.startswith("#"):
+        return None
+
+    absolute = urljoin("https://en.wikipedia.org/", href)
+    parsed = urlparse(absolute)
+    host = parsed.netloc.lower()
+
+    if host.startswith("www."):
+        host = host[4:]
+
+    if host != "wikipedia.org" and not host.endswith(".wikipedia.org"):
+        return None
+
+    query = parse_qs(parsed.query)
+
+    if query.get("redlink") == ["1"]:
+        titles = query.get("title") or []
+
+        if not titles:
+            return None
+
+        return article_url_from_title(titles[0], host)
+
+    if parsed.query:
+        return None
+
+    if not parsed.path.startswith("/wiki/"):
+        return None
+
+    raw_title = unquote(parsed.path[len("/wiki/"):])
+    url = article_url_from_title(raw_title, host)
+
+    if not url:
+        return None
+
+    fragment = unquote(parsed.fragment)
+
+    if fragment and not fragment.startswith("cite_"):
+        url += "#" + quote(fragment, safe="")
+
+    return url
 
 
 # ================================================================
@@ -464,6 +562,7 @@ def normalize_column_name(value):
 
         "name": "event_name",
         "event": "event_name",
+        "incident": "event_name",
         "massacre": "event_name",
     }
 
@@ -491,17 +590,26 @@ def table_to_records(table):
     records = []
 
     for row in table[header_index + 1:]:
-        cells = [cell["text"] for cell in row]
-
-        if not any(cells):
+        if not any(cell["text"] for cell in row):
             continue
 
         record = {}
+        links = {}
 
         for index, header in enumerate(headers):
-            if header:
-                record[header] = cells[index] if index < len(cells) else ""
+            if not header:
+                continue
 
+            if index < len(row):
+                cell = row[index]
+                record[header] = cell["text"]
+
+                if cell["links"]:
+                    links[header] = cell["links"]
+            else:
+                record[header] = ""
+
+        record["_links"] = links
         records.append(record)
 
     return records
@@ -513,6 +621,44 @@ def get_value(record, names):
             return record[name]
 
     return ""
+
+
+def article_url_from_links(links, event_name=""):
+    """
+    Pick the Wikipedia article linked from an event-name cell.
+
+    The event name itself is normally the link. When the cell contains
+    several links, prefer the one whose text is the event name.
+    """
+
+    event_norm = clean_text(event_name).casefold()
+    best_url = None
+    best_score = -1
+
+    for link in links:
+        href = link.get("href") or ""
+        url = wikipedia_article_url(href)
+
+        if not url:
+            continue
+
+        text_norm = clean_text(link.get("text") or "").casefold()
+        score = len(text_norm)
+
+        if event_norm and text_norm and text_norm == event_norm:
+            score += 2000
+        elif event_norm and text_norm and text_norm in event_norm:
+            score += 1000
+
+        # An existing article is a better match than a red link.
+        if "redlink=1" not in href:
+            score += 50
+
+        if score > best_score:
+            best_score = score
+            best_url = url
+
+    return best_url
 
 
 # ================================================================
@@ -736,6 +882,10 @@ def main():
 
                     date_data = parse_date_interval(date_original)
                     killed_data = parse_casualties(killed_original)
+                    article_url = article_url_from_links(
+                        record.get("_links", {}).get("event_name", []),
+                        event_name,
+                    )
 
                     event = {
                         "event_name": event_name,
@@ -759,7 +909,7 @@ def main():
                         "displaced_min": None,
                         "displaced_max": None,
 
-                        "article_url": None,
+                        "article_url": article_url,
 
                         "source_page_title": page["title"],
                         "source_revision_id": page["revision_id"],
@@ -768,7 +918,11 @@ def main():
                         "source_row_number": row_number,
 
                         "raw_row_json": json.dumps(
-                            record,
+                            {
+                                key: value
+                                for key, value in record.items()
+                                if key != "_links"
+                            },
                             ensure_ascii=False,
                         ),
 
