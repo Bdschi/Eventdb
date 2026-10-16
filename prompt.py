@@ -1,5 +1,101 @@
-import sqlite3
 import json
+import sqlite3
+from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlencode, urlparse
+from urllib.request import Request, urlopen
+
+USER_AGENT = (
+    "MassacreResearchDatabase/0.2 "
+    "(academic research; replace-with-your-email@example.org)"
+)
+
+
+def fetch_wikipedia_article(article_url):
+    """
+    Return the plain text of the Wikipedia article at article_url.
+
+    Returns None when the URL is not a Wikipedia article or the page
+    cannot be loaded.
+    """
+    if not article_url or not str(article_url).strip():
+        return None
+
+    parsed = urlparse(str(article_url).strip())
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+
+    if host != "wikipedia.org" and not host.endswith(".wikipedia.org"):
+        return None
+
+    if not parsed.path.startswith("/wiki/"):
+        return None
+
+    title = unquote(parsed.path[len("/wiki/"):]).replace("_", " ").strip()
+    if not title:
+        return None
+
+    api_url = f"https://{host}/w/api.php?" + urlencode({
+        "action": "query",
+        "prop": "extracts",
+        "explaintext": "1",
+        "redirects": "1",
+        "titles": title,
+        "format": "json",
+        "formatversion": "2",
+    })
+    request = Request(
+        api_url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=60) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+
+    pages = data.get("query", {}).get("pages", [])
+    if not pages:
+        return None
+
+    page = pages[0]
+    if page.get("missing") or page.get("invalid"):
+        return None
+
+    extract = (page.get("extract") or "").strip()
+    return extract or None
+
+
+def format_raw_row(raw_row_json):
+    """Return raw_row_json as readable text."""
+    if not raw_row_json:
+        return ""
+
+    try:
+        parsed = json.loads(raw_row_json)
+    except (TypeError, json.JSONDecodeError):
+        return str(raw_row_json)
+
+    return json.dumps(parsed, indent=2, ensure_ascii=False)
+
+
+def input_data_for_row(article_url, raw_row_json):
+    """
+    Use the linked Wikipedia article as input data.
+
+    Fall back to raw_row_json when article_url is empty or the article
+    cannot be retrieved.
+    """
+    article = fetch_wikipedia_article(article_url)
+    if article:
+        return article
+
+    return format_raw_row(raw_row_json)
+
 
 def generate_ai_prompt_from_db(db_path, table_name, row_id):
     """
@@ -12,27 +108,26 @@ def generate_ai_prompt_from_db(db_path, table_name, row_id):
         "injured_original", "injured_min", "injured_max",
         "displaced_original", "displaced_min", "displaced_max"
     ]
-    identifying_cols = ["source_page_title", "raw_row_json", "event_name"]
-
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
-        query = f"SELECT {', '.join(identifying_cols)} FROM `{table_name}` WHERE id = ?"
+        query = f"SELECT article_url, raw_row_json FROM `{table_name}` WHERE id = ?"
         cursor.execute(query, (row_id,))
         row = cursor.fetchone()
 
     if not row:
         raise ValueError(f"No row found with id {row_id}")
 
-    row_data = dict(zip(identifying_cols, row))
+    article_url, raw_row_json = row
+    input_data = input_data_for_row(article_url, raw_row_json)
 
     prompt = f"""You are an expert data analyst.
-Task: Infer missing event details from the 'raw_row_json' and 'event_name' and generate a SQL UPDATE statement.
+Task: Infer missing event details from the input data and generate a SQL UPDATE statement.
 
 Table Name: '{table_name}'
 Target Columns: {', '.join(missing_columns)}
 
 Input Data:
-{json.dumps(row_data, indent=2)}
+{input_data}
 
 Instructions:
 1. Extract dates, locations, and casualty figures (min/max/original).
@@ -77,9 +172,9 @@ def get_id_with_null_date_start(db_path, table_name):
         return None
 
 
-# Example usage:
-db_path = 'events.db'
-table_name = 'events'
-#row_id = int(input("Enter the id to process: "))
-row_id = get_id_with_null_date_start(db_path, table_name)
-print(generate_ai_prompt_from_db(db_path, table_name, row_id))
+if __name__ == "__main__":
+    db_path = "events.db"
+    table_name = "events"
+    #row_id = int(input("Enter the id to process: "))
+    row_id = get_id_with_null_date_start(db_path, table_name)
+    print(generate_ai_prompt_from_db(db_path, table_name, row_id))
